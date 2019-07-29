@@ -26,6 +26,7 @@ import (
 type WriteBatch struct {
 	sync.Mutex
 	txn      *Txn
+	commitTs uint64 // Only used by managed table.
 	db       *DB
 	throttle *y.Throttle
 	err      error
@@ -39,7 +40,22 @@ type WriteBatch struct {
 func (db *DB) NewWriteBatch() *WriteBatch {
 	return &WriteBatch{
 		db:       db,
-		txn:      db.newTransaction(true, true),
+		txn:      db.newTransaction(true, db.opt.managedTxns),
+		throttle: y.NewThrottle(16),
+	}
+}
+
+// NewWriteBatchAt creates a new WriteBatch that will be committed at designated timestamp (for managed tables only).
+// This provides a way to conveniently do a lot of writes,
+// batching them up as tightly as possible in a single transaction and using callbacks to avoid
+// waiting for them to commit, thus achieving good performance.
+// This API hides away the logic of creating and committing transactions.
+// Due to the nature of SSI guaratees provided by Badger, blind writes can never encounter transaction conflicts (ErrConflict).
+func (db *DB) NewWriteBatchAt(commitTs uint64) *WriteBatch {
+	return &WriteBatch{
+		db:       db,
+		txn:      db.newTransaction(true, db.opt.managedTxns),
+		commitTs: commitTs,
 		throttle: y.NewThrottle(16),
 	}
 }
@@ -133,8 +149,12 @@ func (wb *WriteBatch) commit() error {
 	if err := wb.throttle.Do(); err != nil {
 		return err
 	}
-	wb.txn.CommitWith(wb.callback)
-	wb.txn = wb.db.newTransaction(true, true)
+	if wb.db.opt.managedTxns {
+		wb.txn.CommitAt(wb.commitTs, wb.callback)
+	} else {
+		wb.txn.CommitWith(wb.callback)
+	}
+	wb.txn = wb.db.newTransaction(true, wb.db.opt.managedTxns)
 	wb.txn.readTs = 0 // We're not reading anything.
 	return wb.err
 }
